@@ -18,7 +18,13 @@ import {
   getFormSubmissionById,
   deleteFormSubmission,
   getDataProviders,
-  storeProviderMessage
+  storeProviderMessage,
+  storeDataProviderForm,
+  getAllDataProviderForms,
+  getDataProviderFormsByUsernames,
+  createNotification,
+  getNotificationsForUser,
+  markNotificationAsRead,
 } from "../services/database.service.js";
 
 const router = express.Router();
@@ -358,6 +364,157 @@ router.post('/send-provider-message', async (req, res) => {
       error: 'INTERNAL_ERROR',
       message: 'Failed to send provider message'
     });
+  }
+});
+
+/**
+ * POST /api/v1/data-provider-forms
+ * Stores a data provider's form submission in the governance layer DB.
+ */
+router.post('/data-provider-forms', async (req, res) => {
+  try {
+    const { payload } = req.body;
+    const db = req.app.locals.db;
+
+    if (!payload) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_PAYLOAD' });
+    }
+
+    console.log('[GOVERNANCE] Data provider form received:', JSON.stringify(payload, null, 2));
+
+    const id = await storeDataProviderForm(db, payload);
+
+    console.log('[GOVERNANCE] ✅ Data provider form stored:', id);
+    return res.status(201).json({ status: 'SUCCESS', submission_id: id });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error storing data provider form:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * GET /api/v1/data-provider-forms
+ * Lists all data provider form submissions.
+ */
+router.get('/data-provider-forms', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const forms = await getAllDataProviderForms(db);
+    return res.status(200).json({ status: 'SUCCESS', count: forms.length, forms });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error fetching data provider forms:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+// POST /api/v1/notifications — create notifications for multiple recipients in parallel
+router.post('/notifications', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { recipients, senderUsername, message, payload } = req.body;
+
+    if (!Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_RECIPIENTS' });
+    }
+
+    // Send to all recipients in parallel
+    const results = await Promise.all(
+      recipients.map(r =>
+        createNotification(db, {
+          recipientId: r.id,
+          recipientUsername: r.username,
+          senderUsername,
+          message,
+          payload,
+        })
+      )
+    );
+
+    return res.status(201).json({ status: 'SUCCESS', created: results.length, notifications: results });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error creating notifications:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+// GET /api/v1/notifications/:username — fetch notifications for a user
+router.get('/notifications/:username', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { username } = req.params;
+    const rows = await getNotificationsForUser(db, username);
+    return res.json({ status: 'SUCCESS', notifications: rows });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error fetching notifications:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR' });
+  }
+});
+
+// PATCH /api/v1/notifications/:id/read — mark a notification as read
+router.patch('/notifications/:id/read', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { id } = req.params;
+    const { username } = req.body;
+    const updated = await markNotificationAsRead(db, id, username);
+    if (!updated) return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    return res.json({ status: 'SUCCESS', notification: updated });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error marking notification read:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR' });
+  }
+});
+
+/**
+ * GET /api/v1/form-submissions/:id/report
+ *
+ * Returns a combined JSON report: the output owner's form submission plus
+ * the latest data provider form for each selected provider.
+ * Intended for download as a JSON file.
+ */
+router.get('/form-submissions/:id/report', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const db = req.app.locals.db;
+
+    const submission = await getFormSubmissionById(db, id);
+    if (!submission) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    }
+
+    const selectedProviders = submission.selected_providers || [];
+    const usernames = selectedProviders.map(p => p.username).filter(Boolean);
+    const providerForms = await getDataProviderFormsByUsernames(db, usernames);
+
+    const report = {
+      generated_at: new Date().toISOString(),
+      output_owner: {
+        username: submission.output_owner_id,
+        ip_address: submission.ip_address,
+        port: submission.port,
+        model: submission.model,
+        framework: submission.framework,
+        num_server_rounds: submission.num_server_rounds,
+        local_epochs: submission.local_epochs,
+        learning_rate: submission.learning_rate,
+        batch_size: submission.batch_size,
+      },
+      data_providers: providerForms.map(f => ({
+        ip_address: f.ip_address,
+        port: f.port,
+      })),
+    };
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="fl_session_${id}.json"`);
+    return res.status(200).json(report);
+  } catch (error) {
+    console.error('[GOVERNANCE] Error generating report:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
   }
 });
 

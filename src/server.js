@@ -4,7 +4,7 @@
  * This is the main entry point for the Governance Layer backend service.
  * It initializes the Express application with database support and starts both:
  * 1. REST API server (Express) on port 8083 for frontend communication
- * 2. gRPC server on port 50051 for backend-to-backend communication
+ * 2. gRPC server on port 50052 for backend-to-backend communication
  * 
  * The Governance Layer is responsible for:
  * - Receiving and storing Output Owner form submissions
@@ -15,7 +15,7 @@
  * @module server
  */
 
-import 'dotenv/config'; // Load environment variables from .env file
+import './load-env.js'; // Load .env (override:true) before anything else — must be first import
 import app, { initializeApp } from './app.js';
 import { startGrpcServer } from './grpc/governance.server.js';
 
@@ -26,10 +26,10 @@ import { startGrpcServer } from './grpc/governance.server.js';
  * Defaults to 8083 if not specified in environment variables
  * 
  * GRPC_PORT: The port for the gRPC server
- * Defaults to 50051 if not specified in environment variables
+ * Defaults to 50052 if not specified in environment variables
  */
 const REST_PORT = process.env.PORT || 8083;
-const GRPC_PORT = process.env.GRPC_PORT || 50051;
+const GRPC_PORT = process.env.GRPC_PORT || 50052;
 
 /**
  * Start the HTTP Server
@@ -60,7 +60,7 @@ async function startServer() {
     
     // Start gRPC server
     // This server handles gRPC calls from other backend services
-    // It runs on a different port (50051) to avoid conflicts with the REST server
+    // It runs on a different port (50052) to avoid conflicts with the REST server
     const grpcServer = startGrpcServer(db, GRPC_PORT);
     
     console.log(`[INFO] Both servers started successfully`);

@@ -108,9 +108,79 @@ export async function initializeDatabase() {
     END $$;
   `).catch(() => {}); // Ignore if constraint already exists
 
+  // Add columns if upgrading an existing table
+  await targetPool.query(`ALTER TABLE form_submissions ADD COLUMN IF NOT EXISTS selected_providers JSONB DEFAULT '[]'`);
+  await targetPool.query(`ALTER TABLE form_submissions ADD COLUMN IF NOT EXISTS ip_address TEXT`);
+  await targetPool.query(`ALTER TABLE form_submissions ADD COLUMN IF NOT EXISTS port INTEGER`);
+
   console.log('[DATABASE] Table form_submissions ready');
+
+  await targetPool.query(`
+    CREATE TABLE IF NOT EXISTS data_provider_forms (
+      id TEXT PRIMARY KEY,
+      form_id TEXT NOT NULL,
+      data_owner_id TEXT,
+      ram INTEGER,
+      memory_mb INTEGER,
+      data_size_bytes BIGINT,
+      data_resource_id TEXT,
+      ip_address TEXT,
+      port INTEGER,
+      filled BOOLEAN DEFAULT true,
+      filled_at TIMESTAMP,
+      submitted_by TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  console.log('[DATABASE] Table data_provider_forms ready');
+
+  await targetPool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      recipient_id TEXT NOT NULL,
+      recipient_username TEXT NOT NULL,
+      sender_username TEXT NOT NULL,
+      message TEXT NOT NULL,
+      payload JSONB,
+      read BOOLEAN DEFAULT false,
+      read_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await targetPool.query(`CREATE INDEX IF NOT EXISTS notifications_recipient_idx ON notifications(recipient_username)`);
+
+  console.log('[DATABASE] Table notifications ready');
   console.log('[DATABASE] Database initialization complete');
   return targetPool;
+}
+
+export async function createNotification(pool, { recipientId, recipientUsername, senderUsername, message, payload }) {
+  const id = `notif-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await pool.query(
+    `INSERT INTO notifications (id, recipient_id, recipient_username, sender_username, message, payload)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, recipientId, recipientUsername, senderUsername, message, JSON.stringify(payload || {})]
+  );
+  return { id, recipientId, recipientUsername, senderUsername, message, payload, read: false, created_at: new Date().toISOString() };
+}
+
+export async function getNotificationsForUser(pool, username) {
+  const result = await pool.query(
+    `SELECT id, recipient_id, recipient_username, sender_username, message, payload, read, read_at, created_at
+     FROM notifications WHERE recipient_username = $1 ORDER BY created_at DESC LIMIT 50`,
+    [username]
+  );
+  return result.rows;
+}
+
+export async function markNotificationAsRead(pool, notificationId, username) {
+  const result = await pool.query(
+    `UPDATE notifications SET read = true, read_at = NOW()
+     WHERE id = $1 AND recipient_username = $2 RETURNING *`,
+    [notificationId, username]
+  );
+  return result.rows[0] || null;
 }
 
 /**
@@ -146,7 +216,10 @@ export async function storeFormSubmission(pool, formData) {
         framework = $10,
         components = $11,
         filled = true,
-        filled_at = $12
+        filled_at = $12,
+        selected_providers = $13,
+        ip_address = $14,
+        port = $15
       WHERE form_id = $1`,
       [
         formData.form_id,
@@ -160,7 +233,10 @@ export async function storeFormSubmission(pool, formData) {
         formData.model || null,
         formData.framework || null,
         formData.components || {},
-        filledAt
+        filledAt,
+        JSON.stringify(formData.selected_providers || []),
+        formData.ip_address || null,
+        formData.port ? parseInt(formData.port) : null,
       ]
     );
     console.log('[DATABASE] Form submission UPDATED (no duplicate):', submissionId);
@@ -172,8 +248,9 @@ export async function storeFormSubmission(pool, formData) {
         id, form_id, requested_by, output_owner_id,
         num_server_rounds, fraction_evaluate, local_epochs,
         learning_rate, batch_size, model, framework,
-        components, filled, requested_at, filled_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+        components, filled, requested_at, filled_at, selected_providers,
+        ip_address, port
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
       [
         submissionId,
         formData.form_id,
@@ -189,7 +266,10 @@ export async function storeFormSubmission(pool, formData) {
         formData.components || {},
         true,
         formData.requested_at || filledAt,
-        filledAt
+        filledAt,
+        JSON.stringify(formData.selected_providers || []),
+        formData.ip_address || null,
+        formData.port ? parseInt(formData.port) : null,
       ]
     );
     console.log('[DATABASE] Form submission INSERTED:', submissionId);
@@ -258,6 +338,59 @@ export async function getDataProviders(pool) {
     { id: 'provider-2', name: 'Provider B', email: 'provider-b@example.com' },
     { id: 'provider-3', name: 'Provider C', email: 'provider-c@example.com' }
   ];
+}
+
+/**
+ * Store a data provider form submission
+ */
+export async function storeDataProviderForm(pool, formData) {
+  const id = `dpf-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  // Add ip_address and port columns if they don't exist yet (migration for existing DBs)
+  await pool.query(`ALTER TABLE data_provider_forms ADD COLUMN IF NOT EXISTS ip_address TEXT`);
+  await pool.query(`ALTER TABLE data_provider_forms ADD COLUMN IF NOT EXISTS port INTEGER`);
+  await pool.query(
+    `INSERT INTO data_provider_forms
+      (id, form_id, data_owner_id, ram, memory_mb, data_size_bytes, data_resource_id, ip_address, port, filled, filled_at, submitted_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      id,
+      formData.form_id || null,
+      formData.data_owner_id || null,
+      formData.ram || null,
+      formData.memory_mb || null,
+      formData.data_size_bytes || null,
+      formData.data_resource_id || null,
+      formData.ip_address || null,
+      formData.port ? parseInt(formData.port) : null,
+      true,
+      formData.filled_at || new Date().toISOString(),
+      formData.submitted_by || null,
+    ]
+  );
+  console.log('[DATABASE] Data provider form stored:', id);
+  return id;
+}
+
+/**
+ * Get all data provider form submissions
+ */
+export async function getAllDataProviderForms(pool) {
+  const result = await pool.query(
+    `SELECT * FROM data_provider_forms ORDER BY created_at DESC`
+  );
+  return result.rows;
+}
+
+export async function getDataProviderFormsByUsernames(pool, usernames) {
+  if (!usernames || usernames.length === 0) return [];
+  const placeholders = usernames.map((_, i) => `$${i + 1}`).join(', ');
+  const result = await pool.query(
+    `SELECT DISTINCT ON (data_owner_id) * FROM data_provider_forms
+     WHERE data_owner_id IN (${placeholders})
+     ORDER BY data_owner_id, created_at DESC`,
+    usernames
+  );
+  return result.rows;
 }
 
 /**

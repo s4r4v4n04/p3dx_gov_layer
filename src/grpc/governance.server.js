@@ -234,10 +234,10 @@ class GovernanceServer {
  * It loads the .proto file, creates the server, and binds it to a port
  * 
  * @param {Object} db - The database instance
- * @param {number} port - The port to listen on (default: 50051)
+ * @param {number} port - The port to listen on (default: 50052)
  * @returns {Object} The gRPC server instance
  */
-function startGrpcServer(db, port = 50051) {
+function startGrpcServer(db, port = 50052) {
   // Load the .proto file
   // protoLoader.loadSync reads the .proto file and converts it to a JavaScript object
   const PROTO_PATH = path.join(__dirname, '../../protos/governance.proto');

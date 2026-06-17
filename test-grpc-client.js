@@ -39,10 +39,10 @@ const governanceProto = grpc.loadPackageDefinition(packageDefinition).governance
 /**
  * Create the gRPC client
  * 
- * The client connects to the gRPC server running on localhost:50051
+ * The client connects to the gRPC server running on localhost:50052
  * We use insecure credentials for development (no SSL/TLS)
  */
-const GRPC_SERVER_URL = 'localhost:50051';
+const GRPC_SERVER_URL = 'localhost:50052';
 const client = new governanceProto.GovernanceService(
   GRPC_SERVER_URL,
   grpc.credentials.createInsecure()
@@ -219,7 +219,7 @@ testSubmitForm();
  * });
  * 
  * const governanceProto = grpc.loadPackageDefinition(packageDefinition).governance;
- * const GOVERNANCE_GRPC_URL = 'localhost:50051';
+ * const GOVERNANCE_GRPC_URL = 'localhost:50052';
  * 
  * const governanceClient = new governanceProto.GovernanceService(
  *   GOVERNANCE_GRPC_URL,
