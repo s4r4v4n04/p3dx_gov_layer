@@ -12,6 +12,10 @@
  */
 
 import express from "express";
+import { execFile } from "child_process";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import {
   storeFormSubmission,
   getAllFormSubmissions,
@@ -22,12 +26,135 @@ import {
   storeDataProviderForm,
   getAllDataProviderForms,
   getDataProviderFormsByUsernames,
+  getLatestSessionForProvider,
   createNotification,
   getNotificationsForUser,
   markNotificationAsRead,
+  storeSessionReport,
+  getSessionReport,
 } from "../services/database.service.js";
 
 const router = express.Router();
+
+// Location of the distribution script (repo root, two levels above p3dx_gov_layer/src).
+// Override with DISTRIBUTE_SCRIPT if the layout differs.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DISTRIBUTE_SCRIPT =
+  process.env.DISTRIBUTE_SCRIPT ||
+  path.resolve(__dirname, "../../../send_output_owner_config.sh");
+
+// Submission/form ids are embedded in a shell-out; restrict to a safe charset.
+const SAFE_ID = /^[A-Za-z0-9._-]+$/;
+
+// FedML client config template (repo: fedml-ng-release-v1.0/src/config/client_config.yaml).
+const CLIENT_CONFIG_TEMPLATE =
+  process.env.CLIENT_CONFIG_TEMPLATE ||
+  path.resolve(__dirname, "../../../fedml-ng-release-v1.0/src/config/client_config.yaml");
+
+// HTTP push (POST /push-config): the path on each provider's receiver, an
+// optional shared secret sent as X-Auth-Token, and the per-target timeout.
+const PROVIDER_RECEIVER_PATH = process.env.PROVIDER_RECEIVER_PATH || "/update-config";
+const PUSH_AUTH_TOKEN = process.env.PUSH_AUTH_TOKEN || "";
+const PUSH_TIMEOUT_MS = Number(process.env.PUSH_TIMEOUT_MS || 15000);
+
+/**
+ * Render client_config.yaml with the output-owner IP written into BOTH
+ * comm_config.mqtt_discovery.broker_host and comm_config.grpc_discovery.host.
+ * Only those two lines change — section headers, comments, ports and every other
+ * field are preserved (mirrors the section-aware editor in send_output_owner_config.sh).
+ */
+function renderClientConfig(src, ownerIp) {
+  const edits = {
+    grpc_discovery: { host: ownerIp },
+    mqtt_discovery: { broker_host: ownerIp },
+  };
+  const secRe = /^( {2})([A-Za-z_]+):\s*(#.*)?$/; // 2-space section header
+  let section = null;
+  return src
+    .split("\n")
+    .map((line) => {
+      const m = line.match(secRe);
+      if (m) {
+        section = m[2];
+        return line;
+      }
+      if (section && edits[section]) {
+        for (const [key, val] of Object.entries(edits[section])) {
+          const kv = line.match(new RegExp(`^(\\s*${key}:\\s+)(\\S+)(\\s*(?:#.*)?)$`));
+          if (kv) return `${kv[1]}${val}${kv[3]}`;
+        }
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+/**
+ * Serve the rendered config for a given output-owner submission as a YAML download.
+ * Returns 409 if that submission has no ip_address (nothing to put in the hosts).
+ */
+function sendRenderedConfig(res, submission) {
+  const ownerIp = submission.ip_address;
+  if (!ownerIp) {
+    return res.status(409).json({
+      status: "FAILED",
+      error: "NO_OWNER_IP",
+      message: "The output owner has not set an IP address for this session yet.",
+    });
+  }
+  let template;
+  try {
+    template = fs.readFileSync(CLIENT_CONFIG_TEMPLATE, "utf8");
+  } catch (e) {
+    return res.status(500).json({ status: "FAILED", error: "TEMPLATE_NOT_FOUND", message: e.message });
+  }
+  const yaml = renderClientConfig(template, ownerIp);
+  res.setHeader("Content-Type", "application/x-yaml; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="client_config.yaml"');
+  return res.status(200).send(yaml);
+}
+
+/**
+ * Build the combined FL session report from a stored output-owner submission and
+ * the latest data-provider form for each selected provider.
+ *
+ * Includes the full set of fields for both sides so the downloaded report is a
+ * complete record of the session configuration.
+ *
+ * @param {Object} submission - A row from form_submissions
+ * @param {Array}  providerForms - Rows from data_provider_forms (latest per provider)
+ * @returns {Object} The combined report object
+ */
+function buildCombinedReport(submission, providerForms) {
+  return {
+    generated_at: new Date().toISOString(),
+    submission_id: submission.id,
+    form_id: submission.form_id,
+    output_owner: {
+      username: submission.output_owner_id,
+      requested_by: submission.requested_by,
+      ip_address: submission.ip_address,
+      port: submission.port,
+      model: submission.model,
+      framework: submission.framework,
+      num_server_rounds: submission.num_server_rounds,
+      fraction_evaluate: submission.fraction_evaluate,
+      local_epochs: submission.local_epochs,
+      learning_rate: submission.learning_rate,
+      batch_size: submission.batch_size,
+      components: submission.components,
+    },
+    data_providers: (providerForms || []).map(f => ({
+      data_owner_id: f.data_owner_id,
+      ram: f.ram,
+      memory_mb: f.memory_mb,
+      data_size_bytes: f.data_size_bytes,
+      data_resource_id: f.data_resource_id,
+      ip_address: f.ip_address,
+      port: f.port,
+    })),
+  };
+}
 
 /**
  * POST /api/v1/form-submissions
@@ -109,6 +236,28 @@ router.post('/form-submissions', async (req, res) => {
 
     console.log('[GOVERNANCE] ✅ Form stored successfully');
     console.log('[GOVERNANCE] Submission ID:', submissionId);
+
+    // Build and persist the combined session report (output owner + selected data
+    // providers) so it can be downloaded at any time. A failure here must not lose
+    // the form submission itself — the download endpoint can rebuild on the fly.
+    try {
+      const submission = await getFormSubmissionById(db, submissionId);
+      const usernames = (submission.selected_providers || [])
+        .map(p => p.username)
+        .filter(Boolean);
+      const providerForms = await getDataProviderFormsByUsernames(db, usernames);
+      const report = buildCombinedReport(submission, providerForms);
+      await storeSessionReport(db, {
+        submissionId,
+        formId: submission.form_id,
+        outputOwnerId: submission.output_owner_id,
+        report,
+      });
+      console.log('[GOVERNANCE] ✅ Session report persisted for submission:', submissionId);
+    } catch (reportErr) {
+      console.error('[GOVERNANCE] ⚠ Failed to persist session report:', reportErr.message);
+    }
+
     console.log('[GOVERNANCE] ============================================');
 
     // Return success response
@@ -472,48 +621,279 @@ router.patch('/notifications/:id/read', async (req, res) => {
 /**
  * GET /api/v1/form-submissions/:id/report
  *
- * Returns a combined JSON report: the output owner's form submission plus
- * the latest data provider form for each selected provider.
- * Intended for download as a JSON file.
+ * Returns the persisted combined JSON report for a submission: the output owner's
+ * form plus the full details of each selected data provider. Served from the
+ * session_reports table. For submissions stored before reports were persisted,
+ * the report is rebuilt on the fly and saved so future downloads are served from
+ * the stored record. Intended for download as a JSON file.
  */
 router.get('/form-submissions/:id/report', async (req, res) => {
   try {
     const { id } = req.params;
     const db = req.app.locals.db;
 
-    const submission = await getFormSubmissionById(db, id);
-    if (!submission) {
-      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    // Prefer the persisted report.
+    let report = await getSessionReport(db, id);
+
+    if (!report) {
+      // Fallback: rebuild from source tables and persist for next time.
+      const submission = await getFormSubmissionById(db, id);
+      if (!submission) {
+        return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+      }
+
+      const selectedProviders = submission.selected_providers || [];
+      const usernames = selectedProviders.map(p => p.username).filter(Boolean);
+      const providerForms = await getDataProviderFormsByUsernames(db, usernames);
+
+      report = buildCombinedReport(submission, providerForms);
+
+      try {
+        await storeSessionReport(db, {
+          submissionId: id,
+          formId: submission.form_id,
+          outputOwnerId: submission.output_owner_id,
+          report,
+        });
+      } catch (persistErr) {
+        console.error('[GOVERNANCE] ⚠ Failed to persist rebuilt report:', persistErr.message);
+      }
     }
-
-    const selectedProviders = submission.selected_providers || [];
-    const usernames = selectedProviders.map(p => p.username).filter(Boolean);
-    const providerForms = await getDataProviderFormsByUsernames(db, usernames);
-
-    const report = {
-      generated_at: new Date().toISOString(),
-      output_owner: {
-        username: submission.output_owner_id,
-        ip_address: submission.ip_address,
-        port: submission.port,
-        model: submission.model,
-        framework: submission.framework,
-        num_server_rounds: submission.num_server_rounds,
-        local_epochs: submission.local_epochs,
-        learning_rate: submission.learning_rate,
-        batch_size: submission.batch_size,
-      },
-      data_providers: providerForms.map(f => ({
-        ip_address: f.ip_address,
-        port: f.port,
-      })),
-    };
 
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="fl_session_${id}.json"`);
     return res.status(200).json(report);
   } catch (error) {
     console.error('[GOVERNANCE] Error generating report:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * POST /api/v1/distribute-config
+ *
+ * Renders client_config.yaml with the output owner's IP written into both the
+ * MQTT broker_host and the gRPC host, then scp's it to each data provider the
+ * owner selected. Runs send_output_owner_config.sh on the host (the browser
+ * cannot scp). By default targets the owner's selected providers; pass
+ * { all_providers: true } to fan out to every registered provider instead.
+ *
+ * Request Body: { submission_id?: string, form_id?: string, all_providers?: boolean }
+ *   exactly one of submission_id / form_id identifies the owner submission.
+ *
+ * Response: { status: 'SUCCESS' | 'PARTIAL' | 'FAILED', summary?, output }
+ *   summary = { sent, failed, skipped } parsed from the script's final line.
+ */
+router.post('/distribute-config', async (req, res) => {
+  try {
+    const { submission_id, form_id, all_providers } = req.body || {};
+
+    if (!submission_id && !form_id) {
+      return res.status(400).json({
+        status: 'FAILED', error: 'MISSING_SELECTOR',
+        message: 'submission_id or form_id is required',
+      });
+    }
+    if (submission_id && !SAFE_ID.test(submission_id)) {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_SUBMISSION_ID' });
+    }
+    if (form_id && !SAFE_ID.test(form_id)) {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_FORM_ID' });
+    }
+
+    // execFile (no shell) + arg array => the ids cannot be interpreted by a shell.
+    const args = [DISTRIBUTE_SCRIPT];
+    if (submission_id) args.push('--submission-id', submission_id);
+    else args.push('--form-id', form_id);
+    if (all_providers === true) args.push('--all-providers');
+
+    console.log('[GOVERNANCE] distribute-config:', 'bash', args.join(' '));
+
+    execFile('bash', args, { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const output = `${stdout || ''}${stderr || ''}`.trim();
+      // Final line: "Done. ok=N fail=M skipped(...)=K   configs in: ..."
+      const m = output.match(/ok=(\d+)\s+fail=(\d+)\s+skipped[^=]*=(\d+)/);
+      const summary = m ? { sent: +m[1], failed: +m[2], skipped: +m[3] } : null;
+
+      // The script exits non-zero when any send fails; that's still a useful
+      // result as long as we got a summary line. Only treat it as a hard error
+      // when there's no summary at all (e.g. bad selector, DB unreachable).
+      if (err && !summary) {
+        console.error('[GOVERNANCE] distribute-config failed:', err.message);
+        return res.status(500).json({
+          status: 'FAILED', error: 'DISTRIBUTE_ERROR',
+          message: err.message, output,
+        });
+      }
+
+      return res.status(200).json({
+        status: summary && summary.failed === 0 ? 'SUCCESS' : 'PARTIAL',
+        summary,
+        output,
+      });
+    });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error in distribute-config:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * POST /api/v1/push-config
+ *
+ * HTTP push (no SSH): renders client_config.yaml with the output owner's IP and
+ * POSTs it to each selected provider's receiver at http://<ip>:<port><PATH>.
+ * The provider runs provider_config_receiver.py, which writes the file locally.
+ *
+ * The destination ip/port come from each provider's latest data_provider_forms
+ * row (the IP Address + Port they registered). Providers missing an ip or port
+ * are reported as skipped.
+ *
+ * Request Body: { submission_id: string }
+ * Response: { status: 'SUCCESS'|'PARTIAL'|'FAILED', summary:{sent,failed,skipped}, results:[...] }
+ */
+router.post('/push-config', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { submission_id } = req.body || {};
+
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SELECTOR', message: 'submission_id is required' });
+    }
+    if (!SAFE_ID.test(submission_id)) {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_SUBMISSION_ID' });
+    }
+
+    const submission = await getFormSubmissionById(db, submission_id);
+    if (!submission) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'Submission not found' });
+    }
+    const ownerIp = submission.ip_address;
+    if (!ownerIp) {
+      return res.status(409).json({
+        status: 'FAILED', error: 'NO_OWNER_IP',
+        message: 'The output owner has not set an IP address for this session yet.',
+      });
+    }
+
+    const selected = (submission.selected_providers || [])
+      .map(p => p && p.username).filter(Boolean);
+    if (selected.length === 0) {
+      return res.status(200).json({
+        status: 'FAILED', error: 'NO_PROVIDERS',
+        message: 'This session has no selected providers.',
+        summary: { sent: 0, failed: 0, skipped: 0 }, results: [],
+      });
+    }
+
+    let template;
+    try {
+      template = fs.readFileSync(CLIENT_CONFIG_TEMPLATE, 'utf8');
+    } catch (e) {
+      return res.status(500).json({ status: 'FAILED', error: 'TEMPLATE_NOT_FOUND', message: e.message });
+    }
+    const yaml = renderClientConfig(template, ownerIp);
+
+    // Latest data_provider_forms row per selected provider -> ip/port targets.
+    const forms = await getDataProviderFormsByUsernames(db, selected);
+    const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
+
+    const headers = { 'Content-Type': 'application/x-yaml' };
+    if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+
+    // Push to all providers in parallel; never throw — collect a per-target result.
+    const results = await Promise.all(selected.map(async (username) => {
+      const f = byUser.get(username);
+      const ip = f && f.ip_address;
+      const port = f && f.port;
+      if (!ip || !port) {
+        return { username, ip: ip || null, port: port || null, status: 'skipped', reason: 'no registered ip/port' };
+      }
+      const url = `http://${ip}:${port}${PROVIDER_RECEIVER_PATH}`;
+      try {
+        const resp = await fetch(url, {
+          method: 'POST', headers, body: yaml,
+          signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+        });
+        const ok = resp.ok;
+        let detail; try { detail = await resp.text(); } catch { detail = ''; }
+        return { username, ip, port, url, status: ok ? 'sent' : 'failed', http: resp.status,
+                 detail: detail && detail.slice(0, 200) };
+      } catch (e) {
+        return { username, ip, port, url, status: 'failed', reason: e.message };
+      }
+    }));
+
+    const sent = results.filter(r => r.status === 'sent').length;
+    const failed = results.filter(r => r.status === 'failed').length;
+    const skipped = results.filter(r => r.status === 'skipped').length;
+    const status = sent > 0 && failed === 0 ? 'SUCCESS' : sent > 0 ? 'PARTIAL' : 'FAILED';
+
+    console.log(`[GOVERNANCE] push-config ${submission_id}: sent=${sent} failed=${failed} skipped=${skipped}`);
+    return res.status(200).json({ status, summary: { sent, failed, skipped }, results });
+  } catch (error) {
+    console.error('[GOVERNANCE] Error in push-config:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * GET /api/v1/client-config/by-submission/:submissionId
+ *
+ * Owner-side preview/download: returns client_config.yaml rendered with this
+ * submission's output-owner IP. (Registered before the :username route; it has a
+ * deeper path so there is no ambiguity.)
+ */
+router.get('/client-config/by-submission/:submissionId', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const submission = await getFormSubmissionById(db, req.params.submissionId);
+    if (!submission) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'Submission not found' });
+    }
+    return sendRenderedConfig(res, submission);
+  } catch (error) {
+    console.error('[GOVERNANCE] client-config by-submission error:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * GET /api/v1/client-config/:username[?submission_id=...]
+ *
+ * Data-provider pull: returns client_config.yaml with the output-owner IP in the
+ * MQTT broker_host and the gRPC host. Without submission_id, uses the most recent
+ * session that selected this provider (and has an owner IP). The provider must be
+ * part of the session, otherwise 403.
+ */
+router.get('/client-config/:username', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { username } = req.params;
+    const { submission_id } = req.query;
+
+    const submission = submission_id
+      ? await getFormSubmissionById(db, submission_id)
+      : await getLatestSessionForProvider(db, username);
+
+    if (!submission) {
+      return res.status(404).json({
+        status: 'FAILED', error: 'NO_SESSION',
+        message: 'No FL session with an owner IP has selected this provider yet.',
+      });
+    }
+
+    const isSelected = (submission.selected_providers || []).some(p => p && p.username === username);
+    if (!isSelected) {
+      return res.status(403).json({
+        status: 'FAILED', error: 'NOT_SELECTED',
+        message: 'This provider is not part of the requested session.',
+      });
+    }
+
+    return sendRenderedConfig(res, submission);
+  } catch (error) {
+    console.error('[GOVERNANCE] client-config error:', error.message);
     return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
   }
 });
