@@ -12,8 +12,9 @@
  */
 
 import express from "express";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import {
@@ -43,6 +44,22 @@ const DISTRIBUTE_SCRIPT =
   process.env.DISTRIBUTE_SCRIPT ||
   path.resolve(__dirname, "../../../send_output_owner_config.sh");
 
+// Env provisioning (POST /provision-env): HTTP fan-out to each selected
+// provider's receiver, which creates the venv + installs requirements locally
+// (same transport as push-config; no SSH). pip installs are slow, so this gets
+// a much longer per-target timeout than the config push.
+const PROVIDER_PROVISION_PATH = process.env.PROVIDER_PROVISION_PATH || "/provision-env";
+const PROVISION_TIMEOUT_MS = Number(process.env.PROVISION_TIMEOUT_MS || 600000);
+// Empty => let each provider's receiver decide (it creates "venv" next to itself).
+// Set PROVISION_ENV_PATH only to force a specific path on every provider.
+const PROVISION_ENV_PATH = process.env.PROVISION_ENV_PATH || "";
+// requirements.txt installed into each provider's venv; sent in the request body
+// when present. Providers run flo_client.py, so this is the CLIENT requirements
+// (the owner side installs src/server/requirements.txt via output_owner_env_receiver).
+const PROVISION_REQUIREMENTS =
+  process.env.PROVISION_REQUIREMENTS ||
+  path.resolve(__dirname, "../../../fedml-ng-release-v1.0/src/client/requirements.txt");
+
 // Submission/form ids are embedded in a shell-out; restrict to a safe charset.
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
@@ -56,6 +73,200 @@ const CLIENT_CONFIG_TEMPLATE =
 const PROVIDER_RECEIVER_PATH = process.env.PROVIDER_RECEIVER_PATH || "/update-config";
 const PUSH_AUTH_TOKEN = process.env.PUSH_AUTH_TOKEN || "";
 const PUSH_TIMEOUT_MS = Number(process.env.PUSH_TIMEOUT_MS || 15000);
+
+// Start-FL-session (POST /start-fl-session): the output owner is THIS host, so
+// flo_server.py and flo_session.py are launched locally in the existing venv;
+// each selected provider's receiver is asked to launch flo_client.py.
+const FEDML_SRC = process.env.FEDML_SRC || path.resolve(__dirname, "../../../fedml-ng-release-v1.0/src");
+const FEDML_VENV_PY = process.env.FEDML_VENV_PY || path.resolve(__dirname, "../../../venv/bin/python");
+// Output owner is NOT necessarily this host: it is whatever ip:port the owner
+// entered on their form (form_submissions.ip_address / .port), where they run
+// output_owner_env_receiver.py. start-fl-session POSTs to that receiver to build
+// the venv (/provision-env, installing OWNER_REQUIREMENTS = server requirements)
+// and to launch flo_server.py (/start-server) ON THE OWNER HOST. When the form
+// carries no ip/port we fall back to OWNER_ENV_RECEIVER_FALLBACK (single-host:
+// owner == this host).
+const OWNER_RECEIVER_PROVISION_PATH = process.env.OWNER_RECEIVER_PROVISION_PATH || "/provision-env";
+const OWNER_RECEIVER_START_SERVER_PATH = process.env.OWNER_RECEIVER_START_SERVER_PATH || "/start-server";
+const OWNER_RECEIVER_START_SESSION_PATH = process.env.OWNER_RECEIVER_START_SESSION_PATH || "/start-session";
+const OWNER_ENV_RECEIVER_FALLBACK = (process.env.OWNER_ENV_RECEIVER_URL || "http://localhost:8090")
+  .replace(/\/provision-env\/?$/, "").replace(/\/$/, "");
+// Server requirements installed into the owner venv (the client requirements go to
+// providers via PROVISION_REQUIREMENTS).
+const OWNER_REQUIREMENTS =
+  process.env.OWNER_REQUIREMENTS ||
+  path.resolve(__dirname, "../../../fedml-ng-release-v1.0/src/server/requirements.txt");
+const FL_SESSION_CONFIG = process.env.FL_SESSION_CONFIG || "../config/flotilla_quicksetup_config.yaml";
+const FL_SERVER_ENDPOINT = process.env.FL_SERVER_ENDPOINT || "localhost:12345";
+const FL_LOG_DIR = process.env.FL_LOG_DIR || path.resolve(__dirname, "../../../logs");
+const PROVIDER_START_CLIENT_PATH = process.env.PROVIDER_START_CLIENT_PATH || "/start-client";
+// Sequencing: let the server come up before clients connect, and clients
+// register before the session command tells the server to begin.
+const FL_CLIENT_DELAY_MS = Number(process.env.FL_CLIENT_DELAY_MS || 5000);
+// Wait after launching clients so they register with the server before flo_session.py
+// kicks off the round (default 30s).
+const FL_SESSION_DELAY_MS = Number(process.env.FL_SESSION_DELAY_MS || 30000);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const shQuote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+// IPs that mean "this gov_layer host". Used to rewrite the owner receiver address
+// to loopback when the owner is co-located with gov_layer: a VM cannot reach its
+// OWN public IP (no hairpin NAT on most clouds incl. Azure), so a form that names
+// this host's public IP must be dialed via 127.0.0.1 instead. The client_config
+// pushed to providers still uses the form's public IP (providers reach it fine).
+// Auto-includes every local interface IP; extend with OWNER_SELF_IPS (CSV) for
+// public IP(s) that aren't bound to a local interface (the typical cloud case).
+const SELF_IPS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"]);
+for (const ifaces of Object.values(os.networkInterfaces())) {
+  for (const ni of ifaces || []) SELF_IPS.add(ni.address);
+}
+for (const ip of (process.env.OWNER_SELF_IPS || "").split(",")) {
+  const t = ip.trim();
+  if (t) SELF_IPS.add(t);
+}
+// Best-effort: discover this host's PUBLIC IP at startup and treat it as self too,
+// so a public IP entered in the form "just works" no matter how gov_layer was
+// started (the OWNER_SELF_IPS env var is easy to forget). Fire-and-forget; both
+// lookups populate well before any user-triggered start-fl-session. Tries Azure
+// IMDS first, then generic public-IP services.
+(async () => {
+  const addIp = (ip) => { const t = (ip || "").trim(); if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) SELF_IPS.add(t); };
+  // Azure IMDS (may report empty when the public IP lives on the load balancer).
+  try {
+    const r = await fetch(
+      "http://169.254.169.254/metadata/instance/network/interface?api-version=2021-02-01",
+      { headers: { Metadata: "true" }, signal: AbortSignal.timeout(2000) });
+    if (r.ok) {
+      const data = await r.json();
+      for (const iface of data || [])
+        for (const ipcfg of iface?.ipv4?.ipAddress || []) addIp(ipcfg.publicIpAddress);
+    }
+  } catch { /* not on Azure / IMDS unreachable */ }
+  // Generic public-IP services (work off-Azure / when IMDS returns nothing).
+  for (const url of ["https://api.ipify.org", "https://ifconfig.me/ip"]) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
+      if (r.ok) { addIp((await r.text())); break; }
+    } catch { /* offline — rely on interfaces + OWNER_SELF_IPS */ }
+  }
+})();
+
+// Rewrite an IP that names THIS host (see SELF_IPS) to loopback, so a receiver
+// co-located with gov_layer is reachable despite no hairpin NAT. Remote IPs pass
+// through unchanged. Used for both the owner and the providers.
+function reachableHost(ip) {
+  return SELF_IPS.has(ip) ? "127.0.0.1" : ip;
+}
+
+// Base URL of the output owner's receiver, taken from THEIR form (ip:port). The
+// owner can be any host; falls back to OWNER_ENV_RECEIVER_FALLBACK (this host)
+// only when the form carries no ip/port.
+function ownerBaseUrl(submission) {
+  const ip = submission && submission.ip_address;
+  const port = submission && submission.port;
+  if (ip && port) return `http://${reachableHost(ip)}:${port}`;
+  return OWNER_ENV_RECEIVER_FALLBACK;
+}
+
+function ownerAuthHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (PUSH_AUTH_TOKEN) headers["X-Auth-Token"] = PUSH_AUTH_TOKEN;
+  return headers;
+}
+
+// Build the output-owner FL env by POSTing to output_owner_env_receiver.py on the
+// OWNER host (ip:port from the form). That receiver creates the venv + installs the
+// server requirements we send. Returns { ok, url, env_path, installed, stage?,
+// detail? }. Never throws.
+async function provisionOwnerEnv(submission) {
+  const url = `${ownerBaseUrl(submission)}${OWNER_RECEIVER_PROVISION_PATH}`;
+  let requirements = "";
+  try { requirements = fs.readFileSync(OWNER_REQUIREMENTS, "utf8"); } catch { requirements = ""; }
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: ownerAuthHeaders(),
+      body: JSON.stringify({ requirements }), // authoritative server requirements
+      signal: AbortSignal.timeout(PROVISION_TIMEOUT_MS),
+    });
+    let data = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    if (!resp.ok || data.status !== "provisioned" || !data.env_path) {
+      return { ok: false, url, stage: data.stage || "receiver",
+               detail: data.detail || data.message || `HTTP ${resp.status}` };
+    }
+    return { ok: true, url, env_path: data.env_path, installed: !!data.requirements_installed };
+  } catch (e) {
+    return { ok: false, url, stage: "receiver",
+             detail: `output-owner env receiver unreachable at ${url}: ${e.message}` };
+  }
+}
+
+// Launch flo_server.py ON THE OWNER HOST by POSTing to its receiver's /start-server.
+// The receiver runs it detached in the provisioned venv. Returns { ok, url, pid,
+// log, detail? }. Never throws.
+async function startOwnerServer(submission) {
+  const url = `${ownerBaseUrl(submission)}${OWNER_RECEIVER_START_SERVER_PATH}`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: ownerAuthHeaders(),
+      body: "{}",
+      signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+    });
+    let data = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    if (!resp.ok || data.status !== "started") {
+      return { ok: false, url, detail: (data && (data.detail || data.message)) || `HTTP ${resp.status}` };
+    }
+    return { ok: true, url, pid: data.pid, log: data.log };
+  } catch (e) {
+    return { ok: false, url, detail: `output-owner server receiver unreachable at ${url}: ${e.message}` };
+  }
+}
+
+// Kick off the FL round by running flo_session.py ON THE OWNER HOST (POST
+// /start-session). flo_session runs alongside flo_server, so server_endpoint is
+// localhost:12345. Returns { ok, url, pid, log, detail? }. Never throws.
+async function startOwnerSession(submission) {
+  const url = `${ownerBaseUrl(submission)}${OWNER_RECEIVER_START_SESSION_PATH}`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: ownerAuthHeaders(),
+      body: JSON.stringify({ config: FL_SESSION_CONFIG, server_endpoint: FL_SERVER_ENDPOINT }),
+      signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+    });
+    let data = {};
+    try { data = await resp.json(); } catch { data = {}; }
+    if (!resp.ok || data.status !== "started") {
+      return { ok: false, url, detail: (data && (data.detail || data.message)) || `HTTP ${resp.status}` };
+    }
+    return { ok: true, url, pid: data.pid, log: data.log };
+  } catch (e) {
+    return { ok: false, url, detail: `output-owner session receiver unreachable at ${url}: ${e.message}` };
+  }
+}
+
+// Launch a command as a DETACHED background process (no tmux). stdout+stderr are
+// redirected to logFile; the process survives the gov_layer request. Watch it
+// with `tail -f <logFile>`. Returns { ok, pid, log, error? }.
+function launchDetached(argv, cwd, logFile) {
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    const out = fs.openSync(logFile, "a");
+    const child = spawn(argv[0], argv.slice(1), {
+      cwd, detached: true, stdio: ["ignore", out, out],
+    });
+    child.unref();
+    fs.closeSync(out);
+    return { ok: true, pid: child.pid, log: logFile };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
 
 /**
  * Render client_config.yaml with the output-owner IP written into BOTH
@@ -739,6 +950,170 @@ router.post('/distribute-config', async (req, res) => {
 });
 
 /**
+ * Provision a python venv (+ optional requirements install) on each selected
+ * provider by HTTP-POSTing to its receiver's /provision-env. The receiver runs
+ * `python3 -m venv` + pip install locally on the provider VM (no SSH). Targets
+ * ip:port from each provider's latest data_provider_forms row. Never throws —
+ * returns { status, summary:{ok,failed,skipped}, results:[...] }.
+ *
+ * Shared by POST /provision-env and step 0 of POST /start-fl-session.
+ */
+async function provisionProviders(db, selected) {
+  // Optional requirements.txt — sent in the body so the receiver can pip install
+  // it. Absent file is fine: providers just get an empty venv.
+  let requirements = '';
+  try { requirements = fs.readFileSync(PROVISION_REQUIREMENTS, 'utf8'); }
+  catch { requirements = ''; }
+  const reqNote = requirements ? `${PROVISION_REQUIREMENTS}` : 'none (empty venv)';
+  console.log(`[GOVERNANCE] provision: env=${PROVISION_ENV_PATH || 'receiver default (./venv)'} requirements=${reqNote} providers=${selected.length}`);
+
+  // Omit env_path unless explicitly configured, so each receiver creates "venv"
+  // in its own directory.
+  const payload = { requirements };
+  if (PROVISION_ENV_PATH) payload.env_path = PROVISION_ENV_PATH;
+  const body = JSON.stringify(payload);
+  const headers = { 'Content-Type': 'application/json' };
+  if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+
+  const forms = await getDataProviderFormsByUsernames(db, selected);
+  const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
+
+  // Provision all providers in parallel; never throw — collect a per-target result.
+  const results = await Promise.all(selected.map(async (username) => {
+    const f = byUser.get(username);
+    const ip = f && f.ip_address;
+    const port = f && f.port;
+    if (!ip || !port) {
+      return { username, ip: ip || null, port: port || null, status: 'skipped', reason: 'no registered ip/port' };
+    }
+    const url = `http://${reachableHost(ip)}:${port}${PROVIDER_PROVISION_PATH}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'POST', headers, body,
+        signal: AbortSignal.timeout(PROVISION_TIMEOUT_MS),
+      });
+      let detail; try { detail = await resp.text(); } catch { detail = ''; }
+      return { username, ip, port, url, status: resp.ok ? 'ok' : 'failed', http: resp.status,
+               detail: detail && detail.slice(0, 300) };
+    } catch (e) {
+      return { username, ip, port, url, status: 'failed', reason: e.message };
+    }
+  }));
+
+  const ok = results.filter(r => r.status === 'ok').length;
+  const failed = results.filter(r => r.status === 'failed').length;
+  const skipped = results.filter(r => r.status === 'skipped').length;
+  const status = ok > 0 && failed === 0 ? 'SUCCESS' : ok > 0 ? 'PARTIAL' : 'FAILED';
+  return { status, summary: { ok, failed, skipped }, results };
+}
+
+/**
+ * POST /api/v1/provision-env
+ *
+ * Standalone provisioning (also runs automatically as step 0 of start-fl-session).
+ * Request Body: { submission_id: string }
+ * Response: { status: 'SUCCESS'|'PARTIAL'|'FAILED', summary:{ok,failed,skipped}, results:[...] }
+ */
+router.post('/provision-env', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { submission_id } = req.body || {};
+
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SELECTOR', message: 'submission_id is required' });
+    }
+    if (!SAFE_ID.test(submission_id)) {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_SUBMISSION_ID' });
+    }
+
+    const submission = await getFormSubmissionById(db, submission_id);
+    if (!submission) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'Submission not found' });
+    }
+
+    const selected = (submission.selected_providers || [])
+      .map(p => p && p.username).filter(Boolean);
+    if (selected.length === 0) {
+      return res.status(200).json({
+        status: 'FAILED', error: 'NO_PROVIDERS',
+        message: 'This session has no selected providers.',
+        summary: { ok: 0, failed: 0, skipped: 0 }, results: [],
+      });
+    }
+
+    const result = await provisionProviders(db, selected);
+    console.log(`[GOVERNANCE] provision-env ${submission_id}: ok=${result.summary.ok} failed=${result.summary.failed} skipped=${result.summary.skipped}`);
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error('[GOVERNANCE] Error in provision-env:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * Render client_config.yaml with the output owner's IP and POST it to each selected
+ * provider's receiver (/update-config), so flo_client.py points at the owner before
+ * it launches. Destination ip/port come from each provider's latest
+ * data_provider_forms row. Never throws. Returns { status, summary, results,
+ * error?, message? }. Shared by POST /push-config and step 3.5 of start-fl-session.
+ */
+async function renderAndPushClientConfig(db, submission) {
+  const empty = { sent: 0, failed: 0, skipped: 0 };
+  const ownerIp = submission.ip_address;
+  if (!ownerIp) {
+    return { status: 'FAILED', error: 'NO_OWNER_IP',
+             message: 'The output owner has not set an IP address for this session yet.',
+             summary: empty, results: [] };
+  }
+  const selected = (submission.selected_providers || []).map(p => p && p.username).filter(Boolean);
+  if (selected.length === 0) {
+    return { status: 'FAILED', error: 'NO_PROVIDERS',
+             message: 'This session has no selected providers.', summary: empty, results: [] };
+  }
+
+  let template;
+  try {
+    template = fs.readFileSync(CLIENT_CONFIG_TEMPLATE, 'utf8');
+  } catch (e) {
+    return { status: 'FAILED', error: 'TEMPLATE_NOT_FOUND', message: e.message, summary: empty, results: [] };
+  }
+  const yaml = renderClientConfig(template, ownerIp);
+
+  const forms = await getDataProviderFormsByUsernames(db, selected);
+  const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
+  const headers = { 'Content-Type': 'application/x-yaml' };
+  if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+
+  // Push to all providers in parallel; never throw — collect a per-target result.
+  const results = await Promise.all(selected.map(async (username) => {
+    const f = byUser.get(username);
+    const ip = f && f.ip_address;
+    const port = f && f.port;
+    if (!ip || !port) {
+      return { username, ip: ip || null, port: port || null, status: 'skipped', reason: 'no registered ip/port' };
+    }
+    const url = `http://${reachableHost(ip)}:${port}${PROVIDER_RECEIVER_PATH}`;
+    try {
+      const resp = await fetch(url, {
+        method: 'POST', headers, body: yaml,
+        signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+      });
+      let detail; try { detail = await resp.text(); } catch { detail = ''; }
+      return { username, ip, port, url, status: resp.ok ? 'sent' : 'failed', http: resp.status,
+               detail: detail && detail.slice(0, 200) };
+    } catch (e) {
+      return { username, ip, port, url, status: 'failed', reason: e.message };
+    }
+  }));
+
+  const sent = results.filter(r => r.status === 'sent').length;
+  const failed = results.filter(r => r.status === 'failed').length;
+  const skipped = results.filter(r => r.status === 'skipped').length;
+  const status = sent > 0 && failed === 0 ? 'SUCCESS' : sent > 0 ? 'PARTIAL' : 'FAILED';
+  return { status, summary: { sent, failed, skipped }, results };
+}
+
+/**
  * POST /api/v1/push-config
  *
  * HTTP push (no SSH): renders client_config.yaml with the output owner's IP and
@@ -763,76 +1138,148 @@ router.post('/push-config', async (req, res) => {
     if (!SAFE_ID.test(submission_id)) {
       return res.status(400).json({ status: 'FAILED', error: 'INVALID_SUBMISSION_ID' });
     }
-
     const submission = await getFormSubmissionById(db, submission_id);
     if (!submission) {
       return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'Submission not found' });
     }
-    const ownerIp = submission.ip_address;
-    if (!ownerIp) {
-      return res.status(409).json({
-        status: 'FAILED', error: 'NO_OWNER_IP',
-        message: 'The output owner has not set an IP address for this session yet.',
-      });
+
+    const r = await renderAndPushClientConfig(db, submission);
+    const code = r.error === 'NO_OWNER_IP' ? 409 : r.error === 'TEMPLATE_NOT_FOUND' ? 500 : 200;
+    console.log(`[GOVERNANCE] push-config ${submission_id}: sent=${r.summary.sent} failed=${r.summary.failed} skipped=${r.summary.skipped}`);
+    return res.status(code).json(r);
+  } catch (error) {
+    console.error('[GOVERNANCE] Error in push-config:', error.message);
+    return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
+  }
+});
+
+/**
+ * POST /api/v1/start-fl-session
+ *
+ * Brings up the output owner, then provisions the data providers, in order:
+ *   1. OWNER: POST the owner's receiver (ip:port from the form) /provision-env to
+ *      create the venv + install src/server/requirements.txt ON THE OWNER HOST;
+ *   2. OWNER: POST the owner's receiver /start-server to launch flo_server.py
+ *      detached in that venv ON THE OWNER HOST;
+ *   3. PROVIDERS: provision each selected provider's venv + install
+ *      src/client/requirements.txt by POSTing to its receiver's /provision-env;
+ *   3.5 PROVIDERS: push client_config.yaml (owner IP) to each provider so the
+ *      client points at the server before it starts;
+ *   4. PROVIDERS: launch flo_client.py on each provider (POST /start-client);
+ *   5. OWNER: wait FL_SESSION_DELAY_MS (default 30s) for clients to register, then
+ *      run flo_session.py ON THE OWNER HOST (POST /start-session) to kick the round.
+ *
+ * The output owner can be ANY host — its ip:port come from form_submissions
+ * (the owner's own form), not hardcoded to this gov_layer host.
+ *
+ * Request Body: { submission_id: string }
+ * Response: { status, owner, server, provision, push_config, clients, session }
+ */
+router.post('/start-fl-session', async (req, res) => {
+  try {
+    const db = req.app.locals.db;
+    const { submission_id } = req.body || {};
+
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SELECTOR', message: 'submission_id is required' });
+    }
+    if (!SAFE_ID.test(submission_id)) {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_SUBMISSION_ID' });
+    }
+    const submission = await getFormSubmissionById(db, submission_id);
+    if (!submission) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'Submission not found' });
     }
 
-    const selected = (submission.selected_providers || [])
-      .map(p => p && p.username).filter(Boolean);
-    if (selected.length === 0) {
-      return res.status(200).json({
-        status: 'FAILED', error: 'NO_PROVIDERS',
-        message: 'This session has no selected providers.',
-        summary: { sent: 0, failed: 0, skipped: 0 }, results: [],
-      });
-    }
+    // The output owner is whatever ip:port they entered on the form — it can be any
+    // host, not necessarily this one. flo_server.py / requirements live on THAT host.
+    const ownerUrl = ownerBaseUrl(submission);
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: output owner at ${ownerUrl}`);
 
-    let template;
-    try {
-      template = fs.readFileSync(CLIENT_CONFIG_TEMPLATE, 'utf8');
-    } catch (e) {
-      return res.status(500).json({ status: 'FAILED', error: 'TEMPLATE_NOT_FOUND', message: e.message });
+    // 1) OWNER ENV: tell the owner's receiver to create the venv + install the server
+    //    requirements (src/server/requirements.txt) ON THE OWNER HOST. Abort if this
+    //    fails — the server can't start without its environment.
+    const ownerEnv = await provisionOwnerEnv(submission);
+    if (!ownerEnv.ok) {
+      return res.status(502).json({ status: 'FAILED', error: 'OWNER_ENV_FAILED', stage: ownerEnv.stage,
+        message: `Output-owner env provisioning failed at ${ownerEnv.stage} (${ownerEnv.url})`, detail: ownerEnv.detail });
     }
-    const yaml = renderClientConfig(template, ownerIp);
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: owner env ${ownerEnv.env_path} (requirements installed: ${ownerEnv.installed})`);
 
-    // Latest data_provider_forms row per selected provider -> ip/port targets.
+    // 2) FLO_SERVER: ask the owner's receiver to launch flo_server.py (detached, in
+    //    the provisioned venv) ON THE OWNER HOST. The owner is fully up before we
+    //    touch the providers.
+    const server = await startOwnerServer(submission);
+    if (!server.ok) {
+      return res.status(502).json({ status: 'FAILED', error: 'SERVER_LAUNCH_FAILED',
+        message: `Could not start flo_server.py on the output owner (${server.url})`, detail: server.detail });
+    }
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: flo_server pid=${server.pid} log=${server.log} @ ${ownerUrl}`);
+
+    // 3) DATA-PROVIDER SIDE: now that the server is up, provision each selected
+    //    provider's venv (+ install src/client/requirements.txt) by POSTing to its
+    //    receiver's /provision-env. Failures are reported, not fatal.
+    const selected = (submission.selected_providers || []).map(p => p && p.username).filter(Boolean);
+    const provision = await provisionProviders(db, selected);
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: provision ok=${provision.summary.ok} failed=${provision.summary.failed} skipped=${provision.summary.skipped}`);
+
+    // 3.5) PUSH CONFIG: write the owner's IP into each provider's client_config.yaml
+    //      (grpc_discovery.host + mqtt broker_host) BEFORE launching flo_client.py.
+    //      Without this the client reads its stale/template config (host 127.0.0.1)
+    //      and never registers with the server -> session sees "No active clients".
+    const pushConfig = await renderAndPushClientConfig(db, submission);
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: push-config sent=${pushConfig.summary.sent} failed=${pushConfig.summary.failed} skipped=${pushConfig.summary.skipped}`);
+
+    // 4) START CLIENTS: with each provider's env ready and config pointing at the
+    //    owner, ask its receiver to launch flo_client.py (POST /start-client) after a
+    //    short warmup so the server is accepting connections. Per-provider result; a
+    //    failure here is reported, not fatal. flo_session.py is still NOT launched.
+    await sleep(FL_CLIENT_DELAY_MS);
     const forms = await getDataProviderFormsByUsernames(db, selected);
     const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
-
-    const headers = { 'Content-Type': 'application/x-yaml' };
+    const headers = { 'Content-Type': 'application/json' };
     if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
 
-    // Push to all providers in parallel; never throw — collect a per-target result.
-    const results = await Promise.all(selected.map(async (username) => {
+    const clientResults = await Promise.all(selected.map(async (username) => {
       const f = byUser.get(username);
       const ip = f && f.ip_address;
       const port = f && f.port;
-      if (!ip || !port) {
-        return { username, ip: ip || null, port: port || null, status: 'skipped', reason: 'no registered ip/port' };
-      }
-      const url = `http://${ip}:${port}${PROVIDER_RECEIVER_PATH}`;
+      if (!ip || !port) return { username, ip: ip || null, port: port || null, status: 'skipped', reason: 'no registered ip/port' };
+      const url = `http://${reachableHost(ip)}:${port}${PROVIDER_START_CLIENT_PATH}`;
       try {
-        const resp = await fetch(url, {
-          method: 'POST', headers, body: yaml,
-          signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
-        });
-        const ok = resp.ok;
+        const resp = await fetch(url, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(PUSH_TIMEOUT_MS) });
         let detail; try { detail = await resp.text(); } catch { detail = ''; }
-        return { username, ip, port, url, status: ok ? 'sent' : 'failed', http: resp.status,
-                 detail: detail && detail.slice(0, 200) };
+        return { username, ip, port, url, status: resp.ok ? 'started' : 'failed', http: resp.status, detail: detail && detail.slice(0, 200) };
       } catch (e) {
         return { username, ip, port, url, status: 'failed', reason: e.message };
       }
     }));
+    const cstarted = clientResults.filter(r => r.status === 'started').length;
+    const cfailed = clientResults.filter(r => r.status === 'failed').length;
+    const cskipped = clientResults.filter(r => r.status === 'skipped').length;
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: clients started=${cstarted} failed=${cfailed} skipped=${cskipped}`);
 
-    const sent = results.filter(r => r.status === 'sent').length;
-    const failed = results.filter(r => r.status === 'failed').length;
-    const skipped = results.filter(r => r.status === 'skipped').length;
-    const status = sent > 0 && failed === 0 ? 'SUCCESS' : sent > 0 ? 'PARTIAL' : 'FAILED';
+    // 5) START SESSION: wait FL_SESSION_DELAY_MS (default 30s) for the clients to
+    //    register with the server, then run flo_session.py ON THE OWNER HOST to kick
+    //    off the round (POST /start-session). Reported, not fatal.
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: waiting ${FL_SESSION_DELAY_MS}ms for clients to register before flo_session.py`);
+    await sleep(FL_SESSION_DELAY_MS);
+    const session = await startOwnerSession(submission);
+    console.log(`[GOVERNANCE] start-fl-session ${submission_id}: flo_session ${session.ok ? `pid=${session.pid} log=${session.log}` : `FAILED: ${session.detail}`} @ ${ownerUrl}`);
 
-    console.log(`[GOVERNANCE] push-config ${submission_id}: sent=${sent} failed=${failed} skipped=${skipped}`);
-    return res.status(200).json({ status, summary: { sent, failed, skipped }, results });
+    return res.status(200).json({
+      status: 'SUCCESS',
+      owner: { url: ownerUrl, env_path: ownerEnv.env_path, requirements_installed: ownerEnv.installed },
+      server: { pid: server.pid, log: server.log, url: server.url },
+      provision: { summary: provision.summary, results: provision.results },
+      push_config: { status: pushConfig.status, summary: pushConfig.summary, results: pushConfig.results },
+      clients: { summary: { started: cstarted, failed: cfailed, skipped: cskipped }, results: clientResults },
+      session: session.ok
+        ? { status: 'started', pid: session.pid, log: session.log, server_endpoint: FL_SERVER_ENDPOINT, waited_ms: FL_SESSION_DELAY_MS }
+        : { status: 'failed', detail: session.detail, waited_ms: FL_SESSION_DELAY_MS },
+    });
   } catch (error) {
-    console.error('[GOVERNANCE] Error in push-config:', error.message);
+    console.error('[GOVERNANCE] Error in start-fl-session:', error.message);
     return res.status(500).json({ status: 'FAILED', error: 'INTERNAL_ERROR', message: error.message });
   }
 });
