@@ -151,6 +151,23 @@ export async function initializeDatabase() {
   await targetPool.query(`CREATE INDEX IF NOT EXISTS notifications_recipient_idx ON notifications(recipient_username)`);
 
   console.log('[DATABASE] Table notifications ready');
+
+  // Persisted combined FL session reports (output owner + selected data providers).
+  // One row per output-owner submission; the full report JSON is stored so it can be
+  // re-downloaded at any time without rebuilding from the source tables.
+  await targetPool.query(`
+    CREATE TABLE IF NOT EXISTS session_reports (
+      id TEXT PRIMARY KEY,
+      submission_id TEXT UNIQUE NOT NULL,
+      form_id TEXT,
+      output_owner_id TEXT,
+      report JSONB NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  console.log('[DATABASE] Table session_reports ready');
   console.log('[DATABASE] Database initialization complete');
   return targetPool;
 }
@@ -381,6 +398,27 @@ export async function getAllDataProviderForms(pool) {
   return result.rows;
 }
 
+/**
+ * Find the most recent FL session (output-owner submission) that selected the
+ * given provider and has an owner ip_address set. Used by the HTTP pull endpoint
+ * so a data provider can fetch the config rendered with that owner's IP.
+ *
+ * @param {Pool} pool - PostgreSQL connection pool
+ * @param {string} username - The data provider's username
+ * @returns {Promise<Object|null>} The form_submissions row, or null
+ */
+export async function getLatestSessionForProvider(pool, username) {
+  const result = await pool.query(
+    `SELECT * FROM form_submissions
+     WHERE COALESCE(ip_address,'') <> ''
+       AND selected_providers @> $1::jsonb
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [JSON.stringify([{ username }])]
+  );
+  return result.rows[0] || null;
+}
+
 export async function getDataProviderFormsByUsernames(pool, usernames) {
   if (!usernames || usernames.length === 0) return [];
   const placeholders = usernames.map((_, i) => `$${i + 1}`).join(', ');
@@ -391,6 +429,59 @@ export async function getDataProviderFormsByUsernames(pool, usernames) {
     usernames
   );
   return result.rows;
+}
+
+/**
+ * Persist a combined FL session report (output owner + selected data providers).
+ * Upserts on submission_id so re-submitting the same form refreshes the stored report
+ * instead of creating a duplicate.
+ *
+ * @param {Pool} pool - PostgreSQL connection pool
+ * @param {Object} args - { submissionId, formId, outputOwnerId, report }
+ * @returns {Promise<string>} The session report row id
+ */
+export async function storeSessionReport(pool, { submissionId, formId, outputOwnerId, report }) {
+  const existing = await pool.query(
+    `SELECT id FROM session_reports WHERE submission_id = $1`,
+    [submissionId]
+  );
+
+  if (existing.rows.length > 0) {
+    const reportId = existing.rows[0].id;
+    await pool.query(
+      `UPDATE session_reports
+       SET form_id = $2, output_owner_id = $3, report = $4, updated_at = NOW()
+       WHERE submission_id = $1`,
+      [submissionId, formId || null, outputOwnerId || null, JSON.stringify(report)]
+    );
+    console.log('[DATABASE] Session report UPDATED:', reportId);
+    return reportId;
+  }
+
+  const reportId = `rpt-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  await pool.query(
+    `INSERT INTO session_reports (id, submission_id, form_id, output_owner_id, report)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [reportId, submissionId, formId || null, outputOwnerId || null, JSON.stringify(report)]
+  );
+  console.log('[DATABASE] Session report INSERTED:', reportId);
+  return reportId;
+}
+
+/**
+ * Retrieve a persisted session report by the output-owner submission id.
+ *
+ * @param {Pool} pool - PostgreSQL connection pool
+ * @param {string} submissionId - The form_submissions id
+ * @returns {Promise<Object|null>} The stored report JSON, or null if none exists
+ */
+export async function getSessionReport(pool, submissionId) {
+  const result = await pool.query(
+    `SELECT report FROM session_reports WHERE submission_id = $1`,
+    [submissionId]
+  );
+  if (result.rows.length === 0) return null;
+  return result.rows[0].report;
 }
 
 /**
