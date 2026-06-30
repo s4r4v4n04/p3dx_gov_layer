@@ -34,6 +34,7 @@ import {
   storeSessionReport,
   getSessionReport,
 } from "../services/database.service.js";
+import { authHeaders } from "../services/keycloak.service.js";
 
 const router = express.Router();
 
@@ -170,10 +171,11 @@ function ownerBaseUrl(submission) {
   return OWNER_ENV_RECEIVER_FALLBACK;
 }
 
-function ownerAuthHeaders() {
-  const headers = { "Content-Type": "application/json" };
-  if (PUSH_AUTH_TOKEN) headers["X-Auth-Token"] = PUSH_AUTH_TOKEN;
-  return headers;
+// Auth headers for a call to an FL receiver: a Keycloak service-account Bearer
+// token when configured, else the legacy static X-Auth-Token (PUSH_AUTH_TOKEN).
+// Async because the Bearer token is fetched/refreshed from Keycloak.
+async function ownerAuthHeaders() {
+  return authHeaders({ "Content-Type": "application/json" }, PUSH_AUTH_TOKEN);
 }
 
 // Build the output-owner FL env by POSTing to output_owner_env_receiver.py on the
@@ -187,7 +189,7 @@ async function provisionOwnerEnv(submission) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: ownerAuthHeaders(),
+      headers: await ownerAuthHeaders(),
       body: JSON.stringify({ requirements }), // authoritative server requirements
       signal: AbortSignal.timeout(PROVISION_TIMEOUT_MS),
     });
@@ -212,7 +214,7 @@ async function startOwnerServer(submission) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: ownerAuthHeaders(),
+      headers: await ownerAuthHeaders(),
       body: "{}",
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     });
@@ -235,7 +237,7 @@ async function startOwnerSession(submission) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: ownerAuthHeaders(),
+      headers: await ownerAuthHeaders(),
       body: JSON.stringify({ config: FL_SESSION_CONFIG, server_endpoint: FL_SERVER_ENDPOINT }),
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     });
@@ -972,8 +974,7 @@ async function provisionProviders(db, selected) {
   const payload = { requirements };
   if (PROVISION_ENV_PATH) payload.env_path = PROVISION_ENV_PATH;
   const body = JSON.stringify(payload);
-  const headers = { 'Content-Type': 'application/json' };
-  if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+  const headers = await authHeaders({ 'Content-Type': 'application/json' }, PUSH_AUTH_TOKEN);
 
   const forms = await getDataProviderFormsByUsernames(db, selected);
   const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
@@ -1081,8 +1082,7 @@ async function renderAndPushClientConfig(db, submission) {
 
   const forms = await getDataProviderFormsByUsernames(db, selected);
   const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
-  const headers = { 'Content-Type': 'application/x-yaml' };
-  if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+  const headers = await authHeaders({ 'Content-Type': 'application/x-yaml' }, PUSH_AUTH_TOKEN);
 
   // Push to all providers in parallel; never throw — collect a per-target result.
   const results = await Promise.all(selected.map(async (username) => {
@@ -1237,8 +1237,7 @@ router.post('/start-fl-session', async (req, res) => {
     await sleep(FL_CLIENT_DELAY_MS);
     const forms = await getDataProviderFormsByUsernames(db, selected);
     const byUser = new Map(forms.map(f => [f.data_owner_id, f]));
-    const headers = { 'Content-Type': 'application/json' };
-    if (PUSH_AUTH_TOKEN) headers['X-Auth-Token'] = PUSH_AUTH_TOKEN;
+    const headers = await authHeaders({ 'Content-Type': 'application/json' }, PUSH_AUTH_TOKEN);
 
     const clientResults = await Promise.all(selected.map(async (username) => {
       const f = byUser.get(username);
